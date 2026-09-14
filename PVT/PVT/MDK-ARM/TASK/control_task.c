@@ -3,17 +3,20 @@
 #include "bsp_can_DM.h"
 #include "FreeRTOS.h"
 #include "task.h"
+#include "bsp_usart.h"
 
-/* ================= GM6020 ÕæÊµ´ýÃüÁãÎ»ÓëÐÐ³Ì ================= */
-#define GM6020_READY_TOTAL     5527.0f   // ÖÐ¼ä´ýÃü»ù×¼½Ç¶È
-#define SWING_TOTAL_RANGE      2100.0f   // ÏòÉÏ»òÏòÏÂ×î´ó»ÓÅÄÐÐ³Ì
+/* ================= GM6020 Ã•Ã¦ÃŠÂµÂ´Ã½ÃƒÃ¼ÃÃ£ÃŽÂ»Ã“Ã«ÃÃÂ³ÃŒ ================= */
+#define SWING_TOTAL_RANGE      2100.0f   // ÃÃ²Ã‰ÃÂ»Ã²ÃÃ²ÃÃ‚Ã—Ã®Â´Ã³Â»Ã“Ã…Ã„ÃÃÂ³ÃŒ
+#define GM6020_VOLTAGE_LIMIT   25000.0f
 
 extern GM6020_t GM6020;
 extern void GM6020_SendVoltage(int16_t voltage);
 
 static uint8_t motor_enabled = 0;
+static uint8_t gm6020_ready_captured = 0U;
+static float gm6020_ready_total = 0.0f;
 
-/* ================= 1. ´ïÃî×ËÌ¬»ù×¼Êý¾Ý ================= */
+/* ================= 1. Â´Ã¯ÃƒÃ®Ã—Ã‹ÃŒÂ¬Â»Ã¹Ã—Â¼ÃŠÃ½Â¾Ã ================= */
 const float FRONT_READY[5] = {  0.173f, -0.417f, -0.896f, 1.594f, 2.813f };
 const float FRONT_HIT[5]   = {  0.230f,  1.055f, -2.381f, 1.569f, 2.805f };
 
@@ -23,7 +26,7 @@ const float LEFT_HIT[5]    = {  1.737f,  0.860f, -2.112f, 1.833f, 1.232f };
 const float RIGHT_READY[5] = { -1.391f, -0.234f, -1.001f, 1.569f, 1.232f };
 const float RIGHT_HIT[5]   = { -1.341f,  0.744f, -2.009f, 1.673f, 1.214f };
 
-/* ================= 2. ²ÎÊýµ÷½Ú ================= */
+/* ================= 2. Â²ÃŽÃŠÃ½ÂµÃ·Â½Ãš ================= */
 #define YAW_MAX_DEGREE   60.0f  
 #define YAW_MAX_RANGE    (YAW_MAX_DEGREE * 3.1415926f / 180.0f) 
 
@@ -34,14 +37,22 @@ static float target_ratio  = 0.0f;
 #define RAMP_STEP      0.003f   
 #define YAW_RAMP_STEP  0.018f   
 
-// ¡¾ÐÞ¸´ 1¡¿£ºPID ²ÎÊýÀàÐÍÐÞÕýÎª int32_t£¬³¹µ×Ö§³ÖÁ¬Ðø¶àÈ¦¸ºÊýºÍ´óÊýÖµ
+// Â¡Â¾ÃÃžÂ¸Â´ 1Â¡Â¿Â£ÂºPID Â²ÃŽÃŠÃ½Ã€Ã ÃÃÃÃžÃ•Ã½ÃŽÂª int32_tÂ£Â¬Â³Â¹ÂµÃ—Ã–Â§Â³Ã–ÃÂ¬ÃÃ¸Â¶Ã ÃˆÂ¦Â¸ÂºÃŠÃ½ÂºÃÂ´Ã³ÃŠÃ½Ã–Âµ
 static int16_t GM6020_PID_Calc(float target_ecd, int32_t now_total, int16_t now_rpm)
 {
     float error = target_ecd - (float)now_total;
-    float Kp = 30.0f;  // Á¦Á¿²»¹»¿ÉÊÊµ±¸Ä´óÖÁ 35~40
-    float Kd = 2.0f;   // ×èÄá·À¶¶
+    float Kp = 30.0f;  // ÃÂ¦ÃÂ¿Â²Â»Â¹Â»Â¿Ã‰ÃŠÃŠÂµÂ±Â¸Ã„Â´Ã³Ã–Ã 35~40
+    float Kd = 2.0f;   // Ã—Ã¨Ã„Ã¡Â·Ã€Â¶Â¶
 
     float output = Kp * error - Kd * (float)now_rpm;
+
+    /* å¿…é¡»åœ¨ float è½¬ int16_t ä¹‹å‰é™å¹…ï¼Œé¿å…å¼ºè¯¯å·®æ—¶å‘ç”Ÿå®žçŽ°ç›¸å…³çš„æˆªæ–­/æº¢å‡ºã€‚ */
+    if (output > GM6020_VOLTAGE_LIMIT) {
+        output = GM6020_VOLTAGE_LIMIT;
+    } else if (output < -GM6020_VOLTAGE_LIMIT) {
+        output = -GM6020_VOLTAGE_LIMIT;
+    }
+
     return (int16_t)output;
 }
 
@@ -49,7 +60,7 @@ void Control_Task(void *argument)
 {
     vTaskDelay(pdMS_TO_TICKS(1000));
 
-    // ´ïÃîµç»úËÙ¶ÈÓëµçÁ÷³õÊ¼»¯
+    // Â´Ã¯ÃƒÃ®ÂµÃ§Â»ÃºÃ‹Ã™Â¶ÃˆÃ“Ã«ÂµÃ§ÃÃ·Â³ÃµÃŠÂ¼Â»Â¯
     CAN_1.target_vel[0] = 6.0f;
     CAN_1.target_cur[0] = 6.0f;
     CAN_1.target_pos[0] = FRONT_READY[0];
@@ -73,49 +84,78 @@ void Control_Task(void *argument)
         const float *base_pos = NULL;
         const float *hit_pos  = NULL;
 
-        /* ================= 1. ÓÒ²¦¸ËÊ¹ÄÜ¹¤×÷×´Ì¬ ================= */
+        /* é¥æŽ§å™¨å¤±è”æ—¶ï¼Œåœæ­¢æ‰€æœ‰æœ¬ä»»åŠ¡æŽ§åˆ¶çš„æ‰§è¡Œå™¨ã€‚ */
+        if (!RC_IsOnline())
+        {
+            GM6020_SendVoltage(0);
+            if (motor_enabled == 1) {
+                Motor_disable();
+                motor_enabled = 0;
+            }
+            current_ratio = 0.0f;
+            vTaskDelay(pdMS_TO_TICKS(1));
+            continue;
+        }
+
+        /*
+         * ç¬¬ä¸€æ¬¡æ”¶åˆ°æœ‰æ•ˆåé¦ˆæ—¶æ•èŽ·å½“å‰æœºæ¢°ä½ç½®ä½œä¸ºå¾…å‘½åŸºå‡†ã€‚
+         * è¿™æ ·åŸºå‡†ä¸ä¼šåœ¨æ¯æ¬¡æŒ¥æ‹æˆ–æ¯æ¬¡é‡æ–°ä½¿èƒ½æ—¶å›žåˆ°å›ºå®šçš„ 5527ã€‚
+         */
+        if (!GM6020.feedback_valid)
+        {
+            GM6020_SendVoltage(0);
+            vTaskDelay(pdMS_TO_TICKS(1));
+            continue;
+        }
+        if (!gm6020_ready_captured)
+        {
+            gm6020_ready_total = (float)GM6020.total_ecd;
+            gm6020_ready_captured = 1U;
+        }
+
+        /* ================= 1. Ã“Ã’Â²Â¦Â¸Ã‹ÃŠÂ¹Ã„ÃœÂ¹Â¤Ã—Ã·Ã—Â´ÃŒÂ¬ ================= */
         if (rc_ctrl.rc.s[1] == 3)
         {
-            // === A. GM6020 ²¦ÂÖ (ch[4]) »ÓÅÄ¿ØÖÆ ===
+            // === A. GM6020 Â²Â¦Ã‚Ã– (ch[4]) Â»Ã“Ã…Ã„Â¿Ã˜Ã–Ã† ===
             int16_t wheel = rc_ctrl.rc.ch[4];
             float swing_offset = 0.0f;
 
-            // ¡¾ÐÞ¸´ 2¡¿£ºËÀÇøÐÞ¸´£¡¸ÄÎª³£¹æµÄ 30£¬È·±£ÍÆ¹öÂÖÄÜÕý³£ÏìÓ¦
+            // Â¡Â¾ÃÃžÂ¸Â´ 2Â¡Â¿Â£ÂºÃ‹Ã€Ã‡Ã¸ÃÃžÂ¸Â´Â£Â¡Â¸Ã„ÃŽÂªÂ³Â£Â¹Ã¦ÂµÃ„ 30Â£Â¬ÃˆÂ·Â±Â£ÃÃ†Â¹Ã¶Ã‚Ã–Ã„ÃœÃ•Ã½Â³Â£ÃÃ¬Ã“Â¦
             if (wheel > 30 || wheel < -30) {
                 swing_offset = ((float)wheel / 660.0f) * SWING_TOTAL_RANGE;
             } else {
                 swing_offset = 0.0f; 
             }
 
-            // Ä¿±ê¼ÆËã£ºÔÚ´ýÃüÎ»ÖÃ 5527 »ù´¡ÉÏË«ÏòÔö¼õ
-            float gm6020_target_total = GM6020_READY_TOTAL + swing_offset;
+            // ä»¥é¦–æ¬¡æœ‰æ•ˆåé¦ˆæ•èŽ·çš„å¾…å‘½ä½ç½®ä¸ºåŸºå‡†ï¼Œç¦æ­¢æ¯æ¬¡æŒ¥æ‹é‡ç½®åˆ°å›ºå®šå€¼
+            float gm6020_target_total = gm6020_ready_total + swing_offset;
 
-            // ¡¾ÐÞ¸´ 3¡¿£º¶Ô³ÆÏÞ·ù£¡·Å¿íµ½ [3200, 7800]£¬ÉÏ²¦ÏÂ²¦¶¼ÓÐ 2100 ÒÔÉÏµÄÍêÕûÐÐ³Ì
+            // Â¡Â¾ÃÃžÂ¸Â´ 3Â¡Â¿Â£ÂºÂ¶Ã”Â³Ã†ÃÃžÂ·Ã¹Â£Â¡Â·Ã…Â¿Ã­ÂµÂ½ [3200, 7800]Â£Â¬Ã‰ÃÂ²Â¦ÃÃ‚Â²Â¦Â¶Â¼Ã“Ã 2100 Ã’Ã”Ã‰ÃÂµÃ„ÃÃªÃ•Ã»ÃÃÂ³ÃŒ
             if (gm6020_target_total > 7800.0f) gm6020_target_total = 7800.0f;
             if (gm6020_target_total < 3200.0f) gm6020_target_total = 3200.0f;
 
-            // µ÷ÓÃ¶àÈ¦Á¬Ðø PID
+            // ÂµÃ·Ã“ÃƒÂ¶Ã ÃˆÂ¦ÃÂ¬ÃÃ¸ PID
             int16_t voltage_out = GM6020_PID_Calc(gm6020_target_total, GM6020.total_ecd, GM6020.speed_rpm);
             GM6020_SendVoltage(voltage_out);
 
-            // === B. ´ïÃî»÷Çò·½ÏòÑ¡Ôñ ===
-            if (rc_ctrl.rc.s[0] == 1)      // ÉÏ£º×ó»÷Çò
+            // === B. Â´Ã¯ÃƒÃ®Â»Ã·Ã‡Ã²Â·Â½ÃÃ²Ã‘Â¡Ã”Ã± ===
+            if (rc_ctrl.rc.s[0] == 1)      // Ã‰ÃÂ£ÂºÃ—Ã³Â»Ã·Ã‡Ã²
             {
                 base_pos = LEFT_READY;
                 hit_pos  = LEFT_HIT;
             }
-            else if (rc_ctrl.rc.s[0] == 3) // ÖÐ£ºÕýÃæ»÷Çò
+            else if (rc_ctrl.rc.s[0] == 3) // Ã–ÃÂ£ÂºÃ•Ã½ÃƒÃ¦Â»Ã·Ã‡Ã²
             {
                 base_pos = FRONT_READY;
                 hit_pos  = FRONT_HIT;
             }
-            else if (rc_ctrl.rc.s[0] == 2) // ÏÂ£ºÓÒ»÷Çò
+            else if (rc_ctrl.rc.s[0] == 2) // ÃÃ‚Â£ÂºÃ“Ã’Â»Ã·Ã‡Ã²
             {
                 base_pos = RIGHT_READY;
                 hit_pos  = RIGHT_HIT;
             }
 
-            // === C. ´ïÃî¿ØÖÆÖ´ÐÐ ===
+            // === C. Â´Ã¯ÃƒÃ®Â¿Ã˜Ã–Ã†Ã–Â´ÃÃ ===
             if (base_pos != NULL && hit_pos != NULL)
             {
                 if (motor_enabled == 0) {
@@ -169,7 +209,7 @@ void Control_Task(void *argument)
                 Motor_control();
             }
         }
-        /* ================= 2. ¼±Í£Ä£Ê½ ================= */
+        /* ================= 2. Â¼Â±ÃÂ£Ã„Â£ÃŠÂ½ ================= */
         else
         {
             GM6020_SendVoltage(0);

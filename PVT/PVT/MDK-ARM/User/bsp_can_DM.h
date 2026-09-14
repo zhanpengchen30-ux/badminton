@@ -41,6 +41,7 @@ typedef struct {
     int32_t  total_ecd;    // 连续总角度
     int16_t  speed_rpm;
     int16_t  given_current;
+    volatile uint8_t feedback_valid;
 } GM6020_t;
 
 extern GM6020_t GM6020;

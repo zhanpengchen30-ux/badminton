@@ -137,6 +137,7 @@ void HAL_CAN_RxFifo0MsgPendingCallback(CAN_HandleTypeDef *hcan)
 
                 // 计算绝对连续总角度
                 GM6020.total_ecd = GM6020.round_count * 8192 + GM6020.ecd;
+                GM6020.feedback_valid = 1U;
                 return;
             }
 
