@@ -46,6 +46,7 @@
 #include "bsp_can_DM.h"
 #include "dr16.h"
 #include "bsp_usart.h"
+#include "custom_ctrl.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -118,12 +119,14 @@ int main(void)
   MX_TIM4_Init();
   MX_TIM10_Init();
   MX_USART3_UART_Init();
+  MX_USART6_UART_Init();
   /* USER CODE BEGIN 2 */
    delay_init();
   can_filter_init();
 	HAL_Delay(1000);				//��ʱ1sΪ�˸�DM_MC01��ɿص�Դ��Դ1�ȶ�����
 	Motor_enable();					//�������ʹ��		
 	RC_Init();
+	Custom_Ctrl_Init();
   /* USER CODE END 2 */
 
   /* Call init function for freertos objects (in freertos.c) */

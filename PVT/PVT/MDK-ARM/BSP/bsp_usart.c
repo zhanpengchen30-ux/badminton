@@ -3,6 +3,7 @@
 
 uint8_t sbus_rx_buf[18]; 
 extern UART_HandleTypeDef huart3; 
+extern void Custom_Ctrl_RxCallback(UART_HandleTypeDef *huart, uint16_t Size);
 
 void RC_Init(void) {
    
@@ -30,6 +31,11 @@ void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t Size) {
             __HAL_DMA_DISABLE_IT(huart3.hdmarx, DMA_IT_HT);
         }
     }
+		
+if (huart->Instance == USART6)
+{
+    Custom_Ctrl_RxCallback(huart, Size);
+}
 }
 
 void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart) {

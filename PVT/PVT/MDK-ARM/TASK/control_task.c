@@ -3,19 +3,21 @@
 #include "bsp_can_DM.h"
 #include "FreeRTOS.h"
 #include "task.h"
+#include "custom_ctrl.h" 
 
-/* ================= GM6020 真实待命零位与行程 ================= */
-#define GM6020_READY_TOTAL     5527.0f   // 中间待命基准角度
-#define SWING_TOTAL_RANGE      2100.0f   // 向上或向下最大挥拍行程
+/* ================= GM6020 直线化物理位置  ================= */
+#define GM6020_HIT_POS         4103.0f   // 击打上面
+#define GM6020_MID_POS         6215.0f   // 中间待命值 
+#define GM6020_WIND_POS        8237.0f   // 往下蓄力
 
 extern GM6020_t GM6020;
 extern void GM6020_SendVoltage(int16_t voltage);
 
 static uint8_t motor_enabled = 0;
 
-/* ================= 1. 达妙姿态基准数据 ================= */
-const float FRONT_READY[5] = {  0.173f, -0.417f, -0.896f, 1.594f, 2.813f };
-const float FRONT_HIT[5]   = {  0.230f,  1.055f, -2.381f, 1.569f, 2.805f };
+/* ================= 达妙姿态基准数据 ================= */
+const float FRONT_READY[5] = {  0.173f, -0.417f, -0.896f, 1.594f, 2.613f };
+const float FRONT_HIT[5]   = {  0.230f,  1.055f, -2.381f, 1.569f, 2.205f };
 
 const float LEFT_READY[5]  = {  1.709f, -0.309f, -0.907f, 1.606f, 1.260f };
 const float LEFT_HIT[5]    = {  1.737f,  0.860f, -2.112f, 1.833f, 1.232f };
@@ -23,7 +25,6 @@ const float LEFT_HIT[5]    = {  1.737f,  0.860f, -2.112f, 1.833f, 1.232f };
 const float RIGHT_READY[5] = { -1.391f, -0.234f, -1.001f, 1.569f, 1.232f };
 const float RIGHT_HIT[5]   = { -1.341f,  0.744f, -2.009f, 1.673f, 1.214f };
 
-/* ================= 2. 参数调节 ================= */
 #define YAW_MAX_DEGREE   60.0f  
 #define YAW_MAX_RANGE    (YAW_MAX_DEGREE * 3.1415926f / 180.0f) 
 
@@ -34,14 +35,42 @@ static float target_ratio  = 0.0f;
 #define RAMP_STEP      0.003f   
 #define YAW_RAMP_STEP  0.018f   
 
-// 【修复 1】：PID 参数类型修正为 int32_t，彻底支持连续多圈负数和大数值
-static int16_t GM6020_PID_Calc(float target_ecd, int32_t now_total, int16_t now_rpm)
+// 滚轮平滑滤波比例 (-1.0 到 +1.0)
+static float smooth_wheel_ratio = 0.0f;
+#define RATIO_RAMP_STEP        0.012f    // 约 80ms 平滑，消除瞬间猛推冲击
+
+/* ================= 调试专用监控探针 ================= */
+volatile int16_t  dbg_rc_wheel     = 0;    // 1. 遥控器滚轮真实读数
+volatile float    dbg_gm6020_target = 0;   // 2. 单片机算出的目标直线坐标
+volatile float    dbg_gm6020_actual = 0;   // 3. 电机拉平后的真实直线坐标
+volatile float    dbg_gm6020_error  = 0;   // 4. 真实误差
+volatile int16_t  dbg_voltage_out   = 0;   // 5. PID 输出给电机的电压
+volatile uint32_t dbg_mcu_heartbeat = 0;   // 6. 单片机心跳计数器
+
+// 将 GM6020 单圈编码器拉平成无缝直线坐标 
+static float Get_GM6020_Linear_Ecd(uint16_t ecd)
 {
-    float error = target_ecd - (float)now_total;
-    float Kp = 30.0f;  // 力量不够可适当改大至 35~40
-    float Kd = 2.0f;   // 阻尼防抖
+    if (ecd < 3800) {
+        return (float)ecd + 8192.0f; 
+    } else {
+        return (float)ecd;           
+    }
+}
+
+static int16_t GM6020_PID_Calc(float target, float current, int16_t now_rpm)
+{
+    float error = target - current; 
+    dbg_gm6020_error = error;
+
+    float Kp = 32.0f;  
+    float Kd = 2.0f;   
 
     float output = Kp * error - Kd * (float)now_rpm;
+
+    // 防止溢出反转
+    if (output > 25000.0f)  output = 25000.0f;
+    if (output < -25000.0f) output = -25000.0f;
+
     return (int16_t)output;
 }
 
@@ -70,35 +99,90 @@ void Control_Task(void *argument)
 
     while (1)
     {
-        const float *base_pos = NULL;
-        const float *hit_pos  = NULL;
+        dbg_mcu_heartbeat++;
 
-        /* ================= 1. 右拨杆使能工作状态 ================= */
-        if (rc_ctrl.rc.s[1] == 3)
+        // 1. 检查自定义控制器是否超时断连 (> 100ms 认为掉线)
+        if (HAL_GetTick() - custom_ctrl.last_update_time > 100) {
+            custom_ctrl.online = 0;
+        }
+
+        /* ================= 方案 A：自定义主手在线，执行 1:1 示教随动 ================= */
+        if (custom_ctrl.online == 1)
         {
-            // === A. GM6020 拨轮 (ch[4]) 挥拍控制 ===
-            int16_t wheel = rc_ctrl.rc.ch[4];
-            float swing_offset = 0.0f;
-
-            // 【修复 2】：死区修复！改为常规的 30，确保推滚轮能正常响应
-            if (wheel > 30 || wheel < -30) {
-                swing_offset = ((float)wheel / 660.0f) * SWING_TOTAL_RANGE;
-            } else {
-                swing_offset = 0.0f; 
+            if (motor_enabled == 0) {
+                Motor_enable();
+                motor_enabled = 1;
             }
 
-            // 目标计算：在待命位置 5527 基础上双向增减
-            float gm6020_target_total = GM6020_READY_TOTAL + swing_offset;
+            // 1. 达妙 5 个轴直接跟随手柄目标 (注意加上安全限幅)
+            for (int i = 0; i < 5; i++) {
+                CAN_1.target_pos[i] = custom_ctrl.arm_target[i];
+            }
+            Motor_control();
 
-            // 【修复 3】：对称限幅！放宽到 [3200, 7800]，上拨下拨都有 2100 以上的完整行程
-            if (gm6020_target_total > 7800.0f) gm6020_target_total = 7800.0f;
-            if (gm6020_target_total < 3200.0f) gm6020_target_total = 3200.0f;
+            // 2. GM6020 挥拍跟随手掌角度
+            float current_linear = Get_GM6020_Linear_Ecd(GM6020.ecd);
+            dbg_gm6020_actual = current_linear;
+            dbg_gm6020_target = custom_ctrl.gm6020_target;
 
-            // 调用多圈连续 PID
-            int16_t voltage_out = GM6020_PID_Calc(gm6020_target_total, GM6020.total_ecd, GM6020.speed_rpm);
+            int16_t voltage = GM6020_PID_Calc(custom_ctrl.gm6020_target, current_linear, GM6020.speed_rpm);
+            dbg_voltage_out = voltage;
+            GM6020_SendVoltage(voltage);
+        }
+        /* ================= 方案 B：自定义控制器掉线，无缝切回 DR16 遥控器 ================= */
+        else if (rc_ctrl.rc.s[1] == 3)
+        {
+            const float *base_pos = NULL;
+            const float *hit_pos  = NULL;
+
+            // 1. 读取滚轮真实数据
+            int16_t wheel = rc_ctrl.rc.ch[4];
+            dbg_rc_wheel = wheel;
+
+            // 2. 滚轮归一化目标比例 (-1.0 ~ +1.0)
+            float target_wheel_ratio = 0.0f;
+            if (wheel > 30) {
+                target_wheel_ratio = (float)(wheel - 30) / (660.0f - 30.0f);  // 向上推：0.0 到 +1.0
+            } else if (wheel < -30) {
+                target_wheel_ratio = (float)(wheel + 30) / (660.0f - 30.0f); // 向下拨：0.0 到 -1.0
+            } else {
+                target_wheel_ratio = 0.0f; // 回中严格为 0！
+            }
+
+            if (target_wheel_ratio > 1.0f)  target_wheel_ratio = 1.0f;
+            if (target_wheel_ratio < -1.0f) target_wheel_ratio = -1.0f;
+
+            // 3. 平滑滤波比例，避免瞬间大阶跃
+            if (smooth_wheel_ratio < target_wheel_ratio) {
+                smooth_wheel_ratio += RATIO_RAMP_STEP;
+                if (smooth_wheel_ratio > target_wheel_ratio) smooth_wheel_ratio = target_wheel_ratio;
+            } else if (smooth_wheel_ratio > target_wheel_ratio) {
+                smooth_wheel_ratio -= RATIO_RAMP_STEP;
+                if (smooth_wheel_ratio < target_wheel_ratio) smooth_wheel_ratio = target_wheel_ratio;
+            }
+
+            // 4. 计算目标
+            float target_linear = GM6020_MID_POS;
+            if (smooth_wheel_ratio >= 0.0f) {
+                target_linear = GM6020_MID_POS - smooth_wheel_ratio * (GM6020_MID_POS - GM6020_HIT_POS);
+            } else {
+                target_linear = GM6020_MID_POS + (-smooth_wheel_ratio) * (GM6020_WIND_POS - GM6020_MID_POS);
+            }
+
+            if (target_linear < 4103.0f) target_linear = 4103.0f;
+            if (target_linear > 8237.0f) target_linear = 8237.0f;
+
+            dbg_gm6020_target = target_linear;
+
+            float current_linear = Get_GM6020_Linear_Ecd(GM6020.ecd);
+            dbg_gm6020_actual = current_linear;
+
+            int16_t voltage_out = GM6020_PID_Calc(target_linear, current_linear, GM6020.speed_rpm);
+            dbg_voltage_out = voltage_out;
+
             GM6020_SendVoltage(voltage_out);
 
-            // === B. 达妙击球方向选择 ===
+            // === 达妙击球方向选择 ===
             if (rc_ctrl.rc.s[0] == 1)      // 上：左击球
             {
                 base_pos = LEFT_READY;
@@ -115,7 +199,7 @@ void Control_Task(void *argument)
                 hit_pos  = RIGHT_HIT;
             }
 
-            // === C. 达妙控制执行 ===
+            // === 达妙控制执行 ===
             if (base_pos != NULL && hit_pos != NULL)
             {
                 if (motor_enabled == 0) {
@@ -169,10 +253,12 @@ void Control_Task(void *argument)
                 Motor_control();
             }
         }
-        /* ================= 2. 急停模式 ================= */
+        /* ================= 方案 C：急停模式 (失能保护) ================= */
         else
         {
             GM6020_SendVoltage(0);
+            dbg_voltage_out = 0;
+            smooth_wheel_ratio = 0.0f;
 
             if (motor_enabled == 1) {
                 Motor_disable();

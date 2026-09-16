@@ -48,6 +48,7 @@
 extern uint8_t Data[];
 extern uint8_t Data2[];
 extern void Control_Task(void const * argument);
+
 /* USER CODE END PTD */
 
 /* Private define ------------------------------------------------------------*/
@@ -249,11 +250,11 @@ void Gimbal1_Task(void const * argument)
 //void Control_Task(void const * argument)
 //{
 //  /* USER CODE BEGIN Control_Task */
-//  /* Infinite loop */
-//  for(;;)
-//  {
-//    osDelay(1);
-//  }
+////  /* Infinite loop */
+////  for(;;)
+////  {
+////    osDelay(1);
+////  }
 //  /* USER CODE END Control_Task */
 //}
 

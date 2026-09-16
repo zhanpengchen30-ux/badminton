@@ -35,12 +35,9 @@ typedef struct
 } CANx_t;
 
 typedef struct {
-    uint16_t ecd;          // 单圈角度
-    uint16_t last_ecd;     
-    int32_t  round_count;  
-    int32_t  total_ecd;    // 连续总角度
-    int16_t  speed_rpm;
-    int16_t  given_current;
+    uint16_t ecd;          // 机械单圈角度 (0 ~ 8191)
+    int16_t  speed_rpm;    // 转速 (rpm)
+    int16_t  given_current;// 转矩电流
 } GM6020_t;
 
 extern GM6020_t GM6020;

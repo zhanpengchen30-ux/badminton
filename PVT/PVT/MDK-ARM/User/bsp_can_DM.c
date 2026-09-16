@@ -117,26 +117,9 @@ void HAL_CAN_RxFifo0MsgPendingCallback(CAN_HandleTypeDef *hcan)
             // GM6020 反馈解析 (0x206)
             if (CAN_1.Rx_pHeader.StdId == 0x206)
             {
-                GM6020.last_ecd      = GM6020.ecd;
                 GM6020.ecd           = (CAN_1.RxData[0] << 8) | CAN_1.RxData[1];
                 GM6020.speed_rpm     = (CAN_1.RxData[2] << 8) | CAN_1.RxData[3];
                 GM6020.given_current = (CAN_1.RxData[4] << 8) | CAN_1.RxData[5];
-
-                static uint8_t first_flag = 1;
-                if (first_flag) {
-                    GM6020.last_ecd = GM6020.ecd;
-                    first_flag = 0;
-                }
-
-                // 多圈过零自动累加
-                if (GM6020.ecd - GM6020.last_ecd > 4096) {
-                    GM6020.round_count--;
-                } else if (GM6020.ecd - GM6020.last_ecd < -4096) {
-                    GM6020.round_count++;
-                }
-
-                // 计算绝对连续总角度
-                GM6020.total_ecd = GM6020.round_count * 8192 + GM6020.ecd;
                 return;
             }
 
@@ -184,12 +167,12 @@ void GM6020_SendVoltage(int16_t voltage)
     Tx_Buf[1] = 0;
     Tx_Buf[2] = (uint8_t)(voltage >> 8);
     Tx_Buf[3] = (uint8_t)(voltage & 0xFF);
-    Tx_Buf[4] = 0;
-    Tx_Buf[5] = 0;
-    Tx_Buf[6] = 0;
-    Tx_Buf[7] = 0;
 
-    if (HAL_CAN_GetTxMailboxesFreeLevel(&hcan1) > 0) {
-        HAL_CAN_AddTxMessage(&hcan1, &Tx_Header, Tx_Buf, &TxMailbox);
+    
+    uint32_t timeout = 0;
+    while (HAL_CAN_GetTxMailboxesFreeLevel(&hcan1) == 0) {
+        timeout++;
+        if (timeout > 500) return; // 超时退出，防止死锁
     }
+    HAL_CAN_AddTxMessage(&hcan1, &Tx_Header, Tx_Buf, &TxMailbox);
 }
